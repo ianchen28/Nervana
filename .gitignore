@@ -1,0 +1,60 @@
+.DS_Store
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.mamba/
+.conda/
+.python-version
+.env
+.env.*
+.envrc
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Type checkers / linters
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Project outputs & logs
+outputs/
+outputs_*/
+logs/
+*.log
+wandb/
+lightning_logs/
+runs/
+checkpoints/
+models/
+data/
+datasets/
+
+# Caches
+.cache/
+.local/
+
