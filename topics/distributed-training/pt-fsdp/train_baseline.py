@@ -56,7 +56,7 @@ def compute_metrics(eval_pred):
     preds = np.argmax(logits, axis=-1)
     return {
         "accuracy": accuracy.compute(predictions=preds, references=labels)["accuracy"],
-        "f1_macro": f1.compute(predictions=preds, references=labels)["f1"],
+        "f1_macro": f1.compute(predictions=preds, references=labels, average="macro")["f1"],
     }
 
 trainer = Trainer(
