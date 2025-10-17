@@ -1,4 +1,3 @@
-import os
 import torch
 from datasets import load_dataset
 # Load model directly
@@ -15,14 +14,19 @@ import evaluate
 use_cuda = torch.cuda.is_available()
 
 tokenizer = AutoTokenizer.from_pretrained(
-    "google-bert/bert-base-uncased",
+    "bert-base-uncased",
     use_fast=True,
 )
 
 dataset = load_dataset("ag_news")
 
+
 def tokenize_fn(batch):
-    return tokenizer(batch["text"], truncation=True, padding=False, max_length=128)
+    return tokenizer(batch["text"],
+                     truncation=True,
+                     padding=False,
+                     max_length=128)
+
 
 tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
 
@@ -44,20 +48,25 @@ training_args = TrainingArguments(
     load_best_model_at_end=True,
     metric_for_best_model="accuracy",
     report_to=["none"],
-    fp16=use_cuda,
+    # fp16=use_cuda,
     bf16=use_cuda and torch.cuda.is_bf16_supported(),
 )
 
 accuracy = evaluate.load("accuracy")
 f1 = evaluate.load("f1")
 
+
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
     return {
-        "accuracy": accuracy.compute(predictions=preds, references=labels)["accuracy"],
-        "f1_macro": f1.compute(predictions=preds, references=labels, average="macro")["f1"],
+        "accuracy":
+        accuracy.compute(predictions=preds, references=labels)["accuracy"],
+        "f1_macro":
+        f1.compute(predictions=preds, references=labels,
+                   average="macro")["f1"],
     }
+
 
 trainer = Trainer(
     model=model,
