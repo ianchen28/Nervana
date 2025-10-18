@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=0.33",
     "datasets>=2.19",
     "evaluate>=0.4",
+    "loguru>=0.7.0",
     "matplotlib>=3.10.6",
     "numpy>=2.3.3",
     "scikit-learn>=1.7.2",
