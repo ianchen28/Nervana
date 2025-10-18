@@ -192,7 +192,7 @@ all_labels = []
 
 with torch.no_grad():
     for batch in eval_dataloader:
-        batch = {k: v.to(device) for k, v in batch.item()}
+        batch = {k: v.to(device) for k, v in batch.items()}
         output = model(**batch)
 
         logits = output.logits
