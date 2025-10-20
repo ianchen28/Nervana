@@ -1,11 +1,5 @@
+import os
 import torch
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.wrap import (
-    transformer_auto_wrap_policy, )
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from datasets import load_dataset
 # Load model directly
 from transformers import (
@@ -14,38 +8,29 @@ from transformers import (
     DataCollatorWithPadding,
     get_linear_schedule_with_warmup,
 )
+import numpy as np
 import evaluate
-import os
-from functools import partial
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from tqdm.auto import tqdm
+from datetime import datetime
+import json
+import matplotlib.pyplot as plt
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from loguru import logger
 
+accelerator = Accelerator(log_with="loguru")
+logger = get_logger(__name__)
 
-# 分布式训练初始化
-def setup_distributed():
-    """初始化分布式训练环境"""
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-    else:
-        print("未检测到分布式环境，使用单GPU模式")
-        rank = 0
-        world_size = 1
-        local_rank = 0
+# 设置输出和日志目录
+outputs_dir = "outputs"
+if accelerator.is_main_process:
+    os.makedirs(outputs_dir, exist_ok=True)
 
-    # 初始化进程组
-    if world_size > 1:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
-
-    return rank, world_size, local_rank
-
-
-# 初始化分布式环境
-rank, world_size, local_rank = setup_distributed()
 use_cuda = torch.cuda.is_available()
-
-# 设置设备
-device = torch.device(f"cuda:{local_rank}" if use_cuda else "cpu")
+device = torch.device("cuda" if use_cuda else "cpu")
+logger.info(f"Using device: {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(
     "bert-base-uncased",
@@ -53,51 +38,6 @@ tokenizer = AutoTokenizer.from_pretrained(
 )
 
 dataset = load_dataset("ag_news")
-
-
-# FSDP 配置函数
-def get_fsdp_config():
-    """获取 FSDP 配置"""
-    # 混合精度配置
-    mixed_precision_policy = MixedPrecision(
-        param_dtype=torch.bfloat16
-        if torch.cuda.is_bf16_supported() else torch.float16,
-        reduce_dtype=torch.bfloat16
-        if torch.cuda.is_bf16_supported() else torch.float16,
-        buffer_dtype=torch.bfloat16
-        if torch.cuda.is_bf16_supported() else torch.float16,
-    )
-
-    # 自动包装策略 - 针对 Transformer 层
-    auto_wrap_policy = partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            # BERT 的 TransformerEncoderLayer
-            "BertLayer",
-            "BertEncoder",
-            "BertSelfAttention",
-            "BertSelfOutput",
-            "BertIntermediate",
-            "BertOutput",
-        })
-
-    return {
-        "mixed_precision": mixed_precision_policy,
-        "auto_wrap_policy": auto_wrap_policy,
-        "sharding_strategy":
-        torch.distributed.fsdp.ShardingStrategy.FULL_SHARD,
-        "device_id": local_rank,
-    }
-
-
-def setup_fsdp_model(model):
-    """使用 FSDP 包装模型"""
-    fsdp_config = get_fsdp_config()
-
-    # 使用 FSDP 包装模型
-    model = FSDP(model, **fsdp_config)
-
-    return model
 
 
 def tokenize_fn(batch):
@@ -110,246 +50,226 @@ def tokenize_fn(batch):
 tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
 
 num_labels = len(set(tokenized["train"]["label"]))
+print(f"Number of labels: {num_labels}")
 
-# 创建模型
+tokenized.set_format("torch")
+
 model = AutoModelForSequenceClassification.from_pretrained(
     "bert-base-uncased", num_labels=num_labels)
 
-# 使用 FSDP 包装模型
-model = setup_fsdp_model(model)
+model.to(device)
 
-# 训练配置
-BATCH_SIZE = 16
-NUM_EPOCHS = 3
-LEARNING_RATE = 2e-5
-WARMUP_STEPS = 100
-LOGGING_STEPS = 50
-
-# 数据整理器
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
+# parameters
+train_batch_size = 16
+eval_batchs_size = 16
+num_epochs = 3
+lr = 2e-5
 
-# 创建数据加载器
-def create_dataloader(dataset, is_training=True):
-    """创建分布式数据加载器"""
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank,
-        shuffle=is_training) if world_size > 1 else None
+# 训练记录
+training_history = {
+    "train_loss": [],
+    "eval_loss": [],
+    "eval_accuracy": [],
+    "eval_f1": [],
+    "epochs": []
+}
 
-    return DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        sampler=sampler,
-        shuffle=(sampler is None and is_training),
-        collate_fn=data_collator,
-        pin_memory=True,
-    )
-
-
-train_dataloader = create_dataloader(tokenized["train"], is_training=True)
-eval_dataloader = create_dataloader(tokenized["test"], is_training=False)
-
-# 优化器和学习率调度器
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-
-# 计算总步数
-total_steps = len(train_dataloader) * NUM_EPOCHS
-scheduler = get_linear_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=WARMUP_STEPS,
-    num_training_steps=total_steps,
+train_dataloader = DataLoader(
+    tokenized["train"],
+    batch_size=train_batch_size,
+    shuffle=True,
+    collate_fn=data_collator,
 )
 
-# 损失函数
-criterion = torch.nn.CrossEntropyLoss()
+eval_dataloader = DataLoader(
+    tokenized["test"],
+    batch_size=eval_batchs_size,
+    collate_fn=data_collator,
+)
 
-# 评估指标
 accuracy = evaluate.load("accuracy")
 f1 = evaluate.load("f1")
 
 
-# 训练函数
-def train_epoch(model, dataloader, optimizer, scheduler, epoch):
-    """训练一个epoch"""
-    model.train()
-    total_loss = 0
-    num_batches = 0
-
-    for step, batch in enumerate(dataloader):
-        # 将数据移动到设备
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
-
-        # 前向传播
-        optimizer.zero_grad()
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-
-        # 计算损失
-        loss = criterion(logits, labels)
-
-        # 反向传播
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        total_loss += loss.item()
-        num_batches += 1
-
-        # 日志记录
-        if step % LOGGING_STEPS == 0 and rank == 0:
-            print(
-                f"Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.6f}"
-            )
-
-    return total_loss / num_batches
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return {
+        "accuracy":
+        accuracy.compute(predictions=preds, references=labels)["accuracy"],
+        "f1_macro":
+        f1.compute(predictions=preds, references=labels,
+                   average="macro")["f1"],
+    }
 
 
-# 评估函数
-def evaluate_model(model, dataloader):
-    """评估模型"""
+def save_training_history(history, outputs_dir):
+    """保存训练历史记录"""
+    history_path = os.path.join(outputs_dir, "training_history.json")
+    with open(history_path, 'w') as f:
+        json.dump(history, f, indent=2)
+    logger.info(f"训练历史已保存到: {history_path}")
+
+
+def plot_training_curves(history, outputs_dir):
+    """绘制训练曲线"""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle('Training Progress', fontsize=16)
+
+    # 训练损失
+    axes[0, 0].plot(history['epochs'], history['train_loss'], 'b-', label='Train Loss')
+    axes[0, 0].set_title('Training Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+
+    # 验证损失
+    axes[0, 1].plot(history['epochs'], history['eval_loss'], 'r-', label='Eval Loss')
+    axes[0, 1].set_title('Validation Loss')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+
+    # 验证准确率
+    axes[1, 0].plot(history['epochs'], history['eval_accuracy'], 'g-', label='Accuracy')
+    axes[1, 0].set_title('Validation Accuracy')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Accuracy')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+
+    # 验证F1分数
+    axes[1, 1].plot(history['epochs'], history['eval_f1'], 'm-', label='F1 Score')
+    axes[1, 1].set_title('Validation F1 Score')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('F1 Score')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+
+    plt.tight_layout()
+    plot_path = os.path.join(outputs_dir, "training_curves.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"训练曲线已保存到: {plot_path}")
+
+
+def evaluate_model(model, eval_dataloader, device):
+    """评估模型性能"""
     model.eval()
-    all_predictions = []
-    all_labels = []
     total_loss = 0
-    num_batches = 0
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
-        for batch in dataloader:
-            # 将数据移动到设备
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+        for batch in eval_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            output = model(**batch)
 
-            # 前向传播
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
+            total_loss += output.loss.item()
 
-            # 计算损失
-            loss = criterion(logits, labels)
-            total_loss += loss.item()
-            num_batches += 1
+            logits = output.logits
+            labels = batch["labels"]
 
-            # 收集预测结果
-            predictions = torch.argmax(logits, dim=-1)
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_preds.append(logits.to("cpu").numpy())
+            all_labels.append(labels.to("cpu").numpy())
+
+    # 计算平均损失
+    avg_loss = total_loss / len(eval_dataloader)
 
     # 计算指标
-    if rank == 0:
-        acc = accuracy.compute(predictions=all_predictions,
-                               references=all_labels)["accuracy"]
-        f1_score = f1.compute(predictions=all_predictions,
-                              references=all_labels,
-                              average="macro")["f1"]
-        avg_loss = total_loss / num_batches
+    all_preds = np.concatenate(all_preds, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    eval_results = compute_metrics(eval_pred=(all_preds, all_labels))
 
-        print(
-            f"Evaluation - Loss: {avg_loss:.4f}, Accuracy: {acc:.4f}, F1: {f1_score:.4f}"
-        )
-        return {"loss": avg_loss, "accuracy": acc, "f1": f1_score}
-
-    return {"loss": total_loss / num_batches}
+    return avg_loss, eval_results
 
 
-# 检查点保存和加载函数
-def save_fsdp_checkpoint(model, optimizer, scheduler, epoch, output_dir):
-    """保存 FSDP 检查点"""
-    if rank == 0:
-        os.makedirs(output_dir, exist_ok=True)
+logger.info("开始训练...")
 
-    # 同步所有进程
-    if world_size > 1:
-        dist.barrier()
+optimizer = AdamW(model.parameters(), lr=lr)
 
-    # 保存检查点
-    with FSDP.state_dict_type(
-            model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
-        state_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": epoch,
-        }
+num_training_steps = len(train_dataloader) * num_epochs
+lr_scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=10,
+    num_training_steps=num_training_steps,
+)
 
-        if rank == 0:
-            checkpoint_path = os.path.join(output_dir,
-                                           f"checkpoint-epoch-{epoch}.pt")
-            torch.save(state_dict, checkpoint_path)
-            print(f"检查点已保存到: {checkpoint_path}")
+progress_bar = tqdm(range(num_training_steps))
 
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0.0
+    num_batches = 0
 
-def load_fsdp_checkpoint(model, optimizer, scheduler, checkpoint_path):
-    """加载 FSDP 检查点"""
-    if not os.path.exists(checkpoint_path):
-        print(f"检查点文件不存在: {checkpoint_path}")
-        return 0
+    for batch in train_dataloader:
+        batch = {k: v.to(device) for k, v in batch.items()}
 
-    # 加载检查点
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+        output = model(**batch)
+        loss = output.loss
 
-    # 加载模型状态
-    with FSDP.state_dict_type(
-            model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
-        model.load_state_dict(checkpoint["model"])
+        loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
 
-    # 加载优化器和调度器状态
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler.load_state_dict(checkpoint["scheduler"])
+        epoch_loss += loss.item()
+        num_batches += 1
 
-    epoch = checkpoint.get("epoch", 0)
+        progress_bar.update(1)
+        progress_bar.set_description(
+            f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
 
-    if rank == 0:
-        print(f"检查点已加载: {checkpoint_path}, epoch: {epoch}")
+    # 计算平均训练损失
+    avg_epoch_loss = epoch_loss / num_batches
 
-    return epoch
+    # 评估模型
+    eval_loss, eval_results = evaluate_model(model, eval_dataloader, device)
 
+    # 记录训练历史
+    training_history['epochs'].append(epoch + 1)
+    training_history['train_loss'].append(avg_epoch_loss)
+    training_history['eval_loss'].append(eval_loss)
+    training_history['eval_accuracy'].append(eval_results['accuracy'])
+    training_history['eval_f1'].append(eval_results['f1_macro'])
 
-# 主训练循环
-def main():
-    """主训练函数"""
-    if rank == 0:
-        print(f"开始 FSDP 训练，使用 {world_size} 个GPU")
-        print(
-            f"训练配置: batch_size={BATCH_SIZE}, epochs={NUM_EPOCHS}, lr={LEARNING_RATE}"
-        )
+    # 记录日志
+    logger.info(f"Epoch {epoch+1}/{num_epochs} - "
+                f"Train Loss: {avg_epoch_loss:.4f}, "
+                f"Eval Loss: {eval_loss:.4f}, "
+                f"Eval Accuracy: {eval_results['accuracy']:.4f}, "
+                f"Eval F1: {eval_results['f1_macro']:.4f}")
 
-    # 输出目录
-    output_dir = "./outputs_ag_news_bert_base_fsdp"
+    # 保存训练历史
+    save_training_history(training_history, outputs_dir)
 
-    # 训练循环
-    for epoch in range(NUM_EPOCHS):
-        if rank == 0:
-            print(f"\n=== Epoch {epoch + 1}/{NUM_EPOCHS} ===")
+# 训练完成，绘制训练曲线
+logger.info("训练完成，正在生成训练曲线...")
+plot_training_curves(training_history, outputs_dir)
 
-        # 设置分布式采样器的epoch
-        if world_size > 1:
-            train_dataloader.sampler.set_epoch(epoch)
+# 最终评估
+logger.info("进行最终评估...")
+final_eval_loss, final_eval_results = evaluate_model(model, eval_dataloader, device)
 
-        # 训练
-        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler,
-                                 epoch + 1)
+logger.info(f"最终评估结果: {final_eval_results}")
+logger.info(f"最终验证损失: {final_eval_loss:.4f}")
 
-        # 评估
-        if rank == 0:
-            print(f"训练损失: {train_loss:.4f}")
+# 保存最终模型
+final_model_path = os.path.join(outputs_dir, "final_model.pt")
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'training_history': training_history,
+    'final_eval_results': final_eval_results,
+    'timestamp': datetime.now().isoformat()
+}, final_model_path)
+logger.info(f"最终模型已保存到: {final_model_path}")
 
-        evaluate_model(model, eval_dataloader)
-
-        # 保存检查点
-        save_fsdp_checkpoint(model, optimizer, scheduler, epoch + 1,
-                             output_dir)
-
-        # 同步所有进程
-        if world_size > 1:
-            dist.barrier()
-
-    if rank == 0:
-        print("训练完成！")
-        print(f"模型和检查点保存在: {output_dir}")
-
-
-# 运行训练
-if __name__ == "__main__":
-    main()
+print(f"\n✅ 训练完成！")
+print(f"📊 训练历史已保存到: {outputs_dir}/training_history.json")
+print(f"📈 训练曲线已保存到: {outputs_dir}/training_curves.png")
+print(f"💾 最终模型已保存到: {final_model_path}")
+print(f"📝 训练日志已保存到: {logs_dir}/training.log")
